@@ -2,26 +2,18 @@
 
 """
 Генерация наборов параметров для пассивных фильтров.
-
-Модуль формирует таблицу filter_param_sets.csv для топологий:
-    RC_LP, RC_HP, RL_LP, RL_HP, RLC_BP, RLC_NOTCH.
-
-Для RLC-топологий параметры подбираются так, чтобы получить заданные
-диапазоны резонансной частоты и эффективной добротности Q_eff.
 """
 
 from __future__ import annotations
 
 import hashlib
 import math
-from typing import Any
 
 import numpy as np
 import pandas as pd
 
 from ml_circuits.config import (
     C_RANGE_F,
-    CHAR_FREQ_MULTIPLIERS,
     L_RANGE_H,
     R_RANGE_OHM,
     RLC_C_RANGE_F,
@@ -35,15 +27,7 @@ from ml_circuits.config import (
 from ml_circuits.constants import R_FLOOR_OHM
 
 
-def f_key(f: float, ndigits: int = 10) -> float:
-    """
-    Нормализует значение частоты для использования в качестве ключа.
-
-    Округление устраняет микроскопические различия, возникающие из-за
-    арифметики чисел с плавающей точкой.
-    """
-    return float(np.round(float(f), ndigits))
-
+# Один идентификатор param_set_id соответствует одной конфигурации схемы и не зависит от частоты расчёта
 def make_param_set_id(topo: str, R, C, L, Rload, A_in) -> str:
     """
     Формирует идентификатор набора параметров схемы.
@@ -67,18 +51,33 @@ def make_param_set_id(topo: str, R, C, L, Rload, A_in) -> str:
     return hashlib.sha1(key.encode("utf-8")).hexdigest()[:12]
 
 
-def seed_from_param_set_id(param_set_id: str, base_seed: int) -> int:
+def f_key(f: float, ndigits: int = 10) -> float:
     """
-    Формирует воспроизводимое целое значение seed по идентификатору набора параметров.
+    Нормализует значение частоты для использования в качестве ключа.
 
-    Используется для детерминированной локальной рандомизации, зависящей от
-    конкретной схемы (param_set_id) и общего базового seed.
+    Округление устраняет микроскопические различия, возникающие из-за
+    арифметики чисел с плавающей точкой.
     """
-    h = hashlib.blake2b((str(base_seed) + "|" + param_set_id).encode("utf-8"), digest_size=8).digest()
-    return int.from_bytes(h, byteorder="little", signed=False) % (2**32)
+    return float(np.round(float(f), ndigits))
 
 
-def log_uniform(rng: np.random.Generator, a: float, b: float) -> float:
+def _is_valid_rload(x: float) -> bool:
+    """Проверка корректности сопротивления нагрузки."""
+    return np.isfinite(x) and (x > 0.0)
+
+
+def _r_parallel(r1: float, r2: float) -> float:
+    """Эквивалент параллельного соединения сопротивлений r1 || r2."""
+    r1 = float(r1)
+    r2 = float(r2)
+    if (not np.isfinite(r1)) or (not np.isfinite(r2)) or (r1 <= 0) or (r2 <= 0):
+        return float("nan")
+    r1 = max(r1, R_FLOOR_OHM)
+    r2 = max(r2, R_FLOOR_OHM)
+    return 1.0 / (1.0 / r1 + 1.0 / r2)
+
+
+def _log_uniform(rng: np.random.Generator, a: float, b: float) -> float:
     """
     Лог-равномерная выборка из [a, b].
     """
@@ -91,7 +90,7 @@ def log_uniform(rng: np.random.Generator, a: float, b: float) -> float:
     return float(10.0 ** rng.uniform(np.log10(a), np.log10(b)))
 
 
-def balanced_counts(total: int, n_bins: int) -> list[int]:
+def _balanced_counts(total: int, n_bins: int) -> list[int]:
     """
     Делит total объектов почти поровну между n_bins диапазонами.
     Например, 400 и 4 -> [100, 100, 100, 100].
@@ -105,420 +104,478 @@ def balanced_counts(total: int, n_bins: int) -> list[int]:
     ]
 
 
-def r_parallel(a: float | np.ndarray, b: float | np.ndarray) -> float | np.ndarray:
+def _rlc_feasible_f0_range(f_min: float, f_max: float) -> tuple[float, float]:
     """
-    Эквивалентное сопротивление параллельного соединения a || b.
+    Возвращает реально достижимый диапазон f0 для RLC с учётом
+    диапазонов L и C.
+
+    f0 = 1 / (2πsqrt(LC))
+
+    При твоих диапазонах:
+        L = 1e-4...1e-1 Гн
+        C = 1e-8...1e-4 Ф
+
+    минимальная f0 задаётся max(L)*max(C),
+    максимальная f0 задаётся min(L)*min(C).
     """
-    return 1.0 / (1.0 / np.maximum(a, R_FLOOR_OHM) + 1.0 / np.maximum(b, R_FLOOR_OHM))
+    f0_min_components = 1.0 / (
+        2.0 * math.pi * math.sqrt(RLC_L_RANGE_H[1] * RLC_C_RANGE_F[1])
+    )
+
+    f0_max_components = 1.0 / (
+        2.0 * math.pi * math.sqrt(RLC_L_RANGE_H[0] * RLC_C_RANGE_F[0])
+    )
+
+    lo = max(float(f_min), f0_min_components)
+    hi = min(float(f_max), f0_max_components)
+
+    if not (np.isfinite(lo) and np.isfinite(hi) and hi > lo > 0.0):
+        raise ValueError(
+            "No feasible RLC f0 interval. "
+            f"Requested [{f_min}, {f_max}], component-implied "
+            f"[{f0_min_components:.6g}, {f0_max_components:.6g}]."
+        )
+
+    return lo, hi
 
 
-def rlc_feasible_f0_range(
-    L_range: tuple[float, float] = RLC_L_RANGE_H,
-    C_range: tuple[float, float] = RLC_C_RANGE_F,
-) -> tuple[float, float]:
+def _rlc_rho_bounds_for_f0(f0: float) -> tuple[float, float]:
     """
-    Возвращает диапазон резонансных частот f0, достижимый
-    при заданных диапазонах L и C.
-    """
-    L_min, L_max = L_range
-    C_min, C_max = C_range
+    Для заданной f0 находит допустимый диапазон rho = sqrt(L / C).
 
-    f0_min = 1.0 / (2.0 * math.pi * math.sqrt(L_max * C_max))
-    f0_max = 1.0 / (2.0 * math.pi * math.sqrt(L_min * C_min))
+    Используем:
+        f0 = 1 / (2πsqrt(LC))
+        omega0 = 2πf0
+        rho = sqrt(L / C)
 
-    return float(f0_min), float(f0_max)
-
-
-def rlc_rho_bounds_for_f0(
-    f0: float,
-    L_range: tuple[float, float] = RLC_L_RANGE_H,
-    C_range: tuple[float, float] = RLC_C_RANGE_F,
-) -> tuple[float, float] | None:
-    """
-    Возвращает допустимый диапазон rho = sqrt(L / C) для заданной f0.
-
-    При фиксированной f0:
+    Тогда:
         L = rho / omega0
         C = 1 / (rho * omega0)
 
-    где omega0 = 2πf0.
+    Ограничения на L и C дают ограничения на rho.
     """
-    if not np.isfinite(f0) or f0 <= 0.0:
-        return None
+    w0 = 2.0 * math.pi * float(f0)
 
-    w0 = 2.0 * math.pi * f0
+    rho_lo = max(
+        RLC_L_RANGE_H[0] * w0,
+        1.0 / (RLC_C_RANGE_F[1] * w0),
+    )
 
-    L_min, L_max = L_range
-    C_min, C_max = C_range
+    rho_hi = min(
+        RLC_L_RANGE_H[1] * w0,
+        1.0 / (RLC_C_RANGE_F[0] * w0),
+    )
 
-    rho_min_from_L = L_min * w0
-    rho_max_from_L = L_max * w0
-
-    rho_min_from_C = 1.0 / (C_max * w0)
-    rho_max_from_C = 1.0 / (C_min * w0)
-
-    rho_min = max(rho_min_from_L, rho_min_from_C)
-    rho_max = min(rho_max_from_L, rho_max_from_C)
-
-    if rho_min > rho_max:
-        return None
-
-    return float(rho_min), float(rho_max)
+    return float(rho_lo), float(rho_hi)
 
 
-def rlc_req_bounds_for_ratio(
-    R_range: tuple[float, float] = RLC_R_RANGE_OHM,
-    Rload_range: tuple[float, float] = RLC_RLOAD_RANGE_OHM,
-    ratio_range: tuple[float, float] = RLC_R_OVER_RLOAD_RANGE,
-) -> tuple[float, float]:
+def _rlc_req_bounds_for_ratio(k: float) -> tuple[float, float]:
     """
-    Оценивает достижимый диапазон R_eq = R || Rload
-    с учётом диапазонов R, Rload и ограничения на R / Rload.
+    Для заданного k = R / Rload находит допустимый диапазон R_eq.
+
+    Если:
+        k = R / Rload
+
+    и:
+        R_eq = R || Rload
+
+    то:
+        R = R_eq * (1 + k)
+        Rload = R_eq * (1 + k) / k
+
+    Отсюда ограничения на R и Rload превращаются
+    в ограничения на R_eq.
     """
-    R_min, R_max = R_range
-    Rl_min, Rl_max = Rload_range
-    ratio_min, ratio_max = ratio_range
+    k = float(k)
 
-    candidates = []
+    if not (np.isfinite(k) and k > 0.0):
+        return np.nan, np.nan
 
-    for Rload in (Rl_min, Rl_max):
-        for ratio in (ratio_min, ratio_max):
-            R = ratio * Rload
+    req_lo = max(
+        RLC_R_RANGE_OHM[0] / (1.0 + k),
+        RLC_RLOAD_RANGE_OHM[0] * k / (1.0 + k),
+    )
 
-            if R_min <= R <= R_max:
-                candidates.append(r_parallel(R, Rload))
+    req_hi = min(
+        RLC_R_RANGE_OHM[1] / (1.0 + k),
+        RLC_RLOAD_RANGE_OHM[1] * k / (1.0 + k),
+    )
 
-    for R in (R_min, R_max):
-        for ratio in (ratio_min, ratio_max):
-            Rload = R / ratio
-
-            if Rl_min <= Rload <= Rl_max:
-                candidates.append(r_parallel(R, Rload))
-
-    if not candidates:
-        # Грубая оценка, если угловые точки не попали в ограничения.
-        candidates = [
-            r_parallel(R_min, Rl_min),
-            r_parallel(R_min, Rl_max),
-            r_parallel(R_max, Rl_min),
-            r_parallel(R_max, Rl_max),
-        ]
-
-    return float(min(candidates)), float(max(candidates))
+    return float(req_lo), float(req_hi)
 
 
-def split_req_by_r_ratio(
+def _split_req_by_r_ratio(R_eq: float, k: float) -> tuple[float, float]:
+    """
+    Восстанавливает R и Rload из R_eq и k = R / Rload.
+
+    Формулы:
+        R = R_eq * (1 + k)
+        Rload = R_eq * (1 + k) / k
+    """
+    R_eq = float(R_eq)
+    k = float(k)
+
+    if not (np.isfinite(R_eq) and R_eq > 0.0):
+        raise ValueError("R_eq must be positive")
+
+    if not (np.isfinite(k) and k > 0.0):
+        raise ValueError("k must be positive")
+
+    R = R_eq * (1.0 + k)
+    Rload = R_eq * (1.0 + k) / k
+
+    return float(R), float(Rload)
+
+
+def _sample_one_rlc_from_target_q(
     rng: np.random.Generator,
-    R_eq_target: float,
-    R_range: tuple[float, float] = RLC_R_RANGE_OHM,
-    Rload_range: tuple[float, float] = RLC_RLOAD_RANGE_OHM,
-    ratio_range: tuple[float, float] = RLC_R_OVER_RLOAD_RANGE,
-    max_tries: int = 200,
-) -> tuple[float, float] | None:
+    *,
+    topology: str,
+    f_min: float,
+    f_max: float,
+    A_in: float,
+    q_bin: int,
+    max_resample: int,
+) -> dict:
     """
-    Подбирает R и Rload так, чтобы их параллельное соединение
-    было близко к заданному R_eq_target.
+    Генерирует один RLC-набор не через случайные R, L, C, Rload,
+    а через физически осмысленные параметры:
+
+        f0
+        Q_eff
+        rho = sqrt(L / C)
+        R_eq = R || Rload
+        k = R / Rload
+
+    Основные формулы:
+
+        Q_eff = sqrt(L / C) / R_eq
+        f0 = 1 / (2πsqrt(LC))
+
+    Поэтому:
+        rho = sqrt(L / C)
+        R_eq = rho / Q_eff
+        L = rho / omega0
+        C = 1 / (rho * omega0)
     """
-    if not np.isfinite(R_eq_target) or R_eq_target <= 0.0:
-        return None
+    if topology not in {"RLC_BP", "RLC_NOTCH"}:
+        raise ValueError("RLC sampler expects RLC_BP or RLC_NOTCH")
 
-    R_min, R_max = R_range
-    Rl_min, Rl_max = Rload_range
-    ratio_min, ratio_max = ratio_range
+    f0_lo, f0_hi = _rlc_feasible_f0_range(f_min, f_max)
 
-    for _ in range(max_tries):
-        ratio = log_uniform(rng, ratio_min, ratio_max)
+    q_lo, q_hi = RLC_Q_BINS[int(q_bin)]
 
-        # R = ratio * Rload
-        # R_eq = R || Rload = ratio / (ratio + 1) * Rload
-        Rload = R_eq_target * (ratio + 1.0) / ratio
-        R = ratio * Rload
+    for _try in range(max_resample):
+        # 1. Целевая резонансная частота
+        f0 = _log_uniform(rng, f0_lo, f0_hi)
 
-        if R_min <= R <= R_max and Rl_min <= Rload <= Rl_max:
-            return float(R), float(Rload)
+        # 2. Целевая добротность из конкретного q_bin
+        Q_eff = _log_uniform(rng, q_lo, q_hi)
 
-    return None
+        # 3. Отношение R / Rload
+        k = _log_uniform(rng, *RLC_R_OVER_RLOAD_RANGE)
 
+        # 4. Допустимый диапазон rho из ограничений на L и C
+        rho_lc_lo, rho_lc_hi = _rlc_rho_bounds_for_f0(f0)
 
-def sample_one_rlc_from_target_q(
-    rng: np.random.Generator,
-    f0: float,
-    Q_eff: float,
-    max_tries: int = 300,
-) -> dict[str, float] | None:
-    """
-    Сэмплирует один набор параметров RLC-схемы для заданных f0 и Q_eff.
+        # 5. Допустимый диапазон R_eq из ограничений на R и Rload
+        req_lo, req_hi = _rlc_req_bounds_for_ratio(k)
 
-    Для используемой топологии эффективная добротность задаётся приближённо:
-        Q_eff = R_eq / sqrt(L / C),
-    где R_eq = R || Rload.
-    """
-    rho_bounds = rlc_rho_bounds_for_f0(f0)
+        # 6. Так как Q_eff = rho / R_eq,
+        #    то rho = Q_eff * R_eq.
+        #    Пересекаем допустимые диапазоны rho.
+        rho_lo = max(rho_lc_lo, Q_eff * req_lo)
+        rho_hi = min(rho_lc_hi, Q_eff * req_hi)
 
-    if rho_bounds is None:
-        return None
+        if not (
+            np.isfinite(rho_lo)
+            and np.isfinite(rho_hi)
+            and rho_hi > rho_lo > 0.0
+        ):
+            continue
 
-    rho_min, rho_max = rho_bounds
+        # 7. Выбираем rho внутри физически допустимого пересечения
+        rho = _log_uniform(rng, rho_lo, rho_hi)
 
-    for _ in range(max_tries):
-        rho = log_uniform(rng, rho_min, rho_max)
+        # 8. Из Q_eff = rho / R_eq получаем R_eq
+        R_eq = rho / Q_eff
 
-        # rho = sqrt(L / C), omega0 = 1 / sqrt(LC)
+        # 9. Из R_eq и k восстанавливаем R и Rload
+        R, Rload = _split_req_by_r_ratio(R_eq, k)
+
+        # 10. Из f0 и rho восстанавливаем L и C
         w0 = 2.0 * math.pi * f0
+
         L = rho / w0
         C = 1.0 / (rho * w0)
 
-        if not (RLC_L_RANGE_H[0] <= L <= RLC_L_RANGE_H[1]):
+        # 11. Жёсткие проверки диапазонов
+        if not (
+            RLC_R_RANGE_OHM[0] <= R <= RLC_R_RANGE_OHM[1]
+            and RLC_RLOAD_RANGE_OHM[0] <= Rload <= RLC_RLOAD_RANGE_OHM[1]
+            and RLC_L_RANGE_H[0] <= L <= RLC_L_RANGE_H[1]
+            and RLC_C_RANGE_F[0] <= C <= RLC_C_RANGE_F[1]
+        ):
             continue
 
-        if not (RLC_C_RANGE_F[0] <= C <= RLC_C_RANGE_F[1]):
+        # 12. Финальная численная проверка формул
+        f0_check = 1.0 / (2.0 * math.pi * math.sqrt(L * C))
+        R_eq_check = _r_parallel(R, Rload)
+        Q_check = math.sqrt(L / C) / R_eq_check
+
+        if not (
+            np.isfinite(f0_check)
+            and np.isfinite(Q_check)
+            and abs(math.log(f0_check / f0)) < 1e-10
+            and abs(math.log(Q_check / Q_eff)) < 1e-10
+        ):
             continue
 
-        R_eq_target = Q_eff * rho
-        split = split_req_by_r_ratio(rng, R_eq_target)
-
-        if split is None:
-            continue
-
-        R, Rload = split
-        R_eq = r_parallel(R, Rload)
-        Q_actual = R_eq / rho
-
-        return {
-            "R": float(R),
-            "Rload": float(Rload),
-            "L": float(L),
-            "C": float(C),
-            "f0": float(f0),
-            "Q_eff": float(Q_actual),
-            "R_eq": float(R_eq),
-        }
-
-    return None
-
-
-def _sample_order1_param_set(
-    rng: np.random.Generator,
-    topology: str,
-    f_min: float,
-    f_max: float,
-    A_in: float,
-    max_resample: int = 200,
-) -> dict[str, Any] | None:
-    """
-    Сэмплирует один набор параметров для RC/RL-фильтра первого порядка.
-    """
-    if topology in {"RC_LP", "RC_HP"}:
-        for _ in range(max_resample):
-            fc = log_uniform(rng, f_min, f_max)
-            R = log_uniform(rng, *R_RANGE_OHM)
-
-            if topology == "RC_LP":
-                Rload = log_uniform(rng, *RLOAD_RANGE_OHM)
-                R_eq = r_parallel(R, Rload)
-            else:
-                Rload = np.nan
-                R_eq = R
-
-            C = 1.0 / (2.0 * math.pi * R_eq * fc)
-
-            if C_RANGE_F[0] <= C <= C_RANGE_F[1]:
-                payload = {
-                    "A_in": A_in,
-                    "R": float(R),
-                    "C": float(C),
-                    "L": np.nan,
-                    "Rload": float(Rload) if np.isfinite(Rload) else np.nan,
-                    "fc": float(fc),
-                    "f0": np.nan,
-                    "Q_eff": np.nan,
-                    "R_eq": float(R_eq),
-                }
-                payload["param_set_id"] = make_param_set_id(topology, payload)
-                payload["topology"] = topology
-                return payload
-
-    if topology in {"RL_LP", "RL_HP"}:
-        for _ in range(max_resample):
-            fc = log_uniform(rng, f_min, f_max)
-            R = log_uniform(rng, *R_RANGE_OHM)
-
-            if topology == "RL_HP":
-                Rload = log_uniform(rng, *RLOAD_RANGE_OHM)
-                R_eq = r_parallel(R, Rload)
-            else:
-                Rload = np.nan
-                R_eq = R
-
-            L = R_eq / (2.0 * math.pi * fc)
-
-            if L_RANGE_H[0] <= L <= L_RANGE_H[1]:
-                payload = {
-                    "A_in": A_in,
-                    "R": float(R),
-                    "C": np.nan,
-                    "L": float(L),
-                    "Rload": float(Rload) if np.isfinite(Rload) else np.nan,
-                    "fc": float(fc),
-                    "f0": np.nan,
-                    "Q_eff": np.nan,
-                    "R_eq": float(R_eq),
-                }
-                payload["param_set_id"] = make_param_set_id(topology, payload)
-                payload["topology"] = topology
-                return payload
-
-    return None
-
-
-def _sample_rlc_param_sets_for_topology(
-    rng: np.random.Generator,
-    topology: str,
-    n_param_sets: int,
-    f_min: float,
-    f_max: float,
-    A_in: float,
-    max_resample: int = 500,
-) -> tuple[list[dict[str, Any]], int]:
-    """
-    Генерирует наборы параметров для одной RLC-топологии
-    с балансировкой по диапазонам Q_eff.
-    """
-    rows: list[dict[str, Any]] = []
-    skipped = 0
-
-    counts = balanced_counts(n_param_sets, len(RLC_Q_BINS))
-
-    f0_feasible_min, f0_feasible_max = rlc_feasible_f0_range()
-    f0_low = max(f_min, f0_feasible_min)
-    f0_high = min(f_max, f0_feasible_max)
-
-    if f0_low >= f0_high:
-        raise ValueError(
-            "Диапазон f0 для RLC несовместим с диапазонами L и C: "
-            f"[{f0_low}, {f0_high}]"
+        param_set_id = make_param_set_id(
+            topology,
+            R,
+            C,
+            L,
+            Rload,
+            A_in,
         )
 
-    for q_bin, n_bin in zip(RLC_Q_BINS, counts):
-        q_low, q_high = q_bin
+        return {
+            "param_set_id": param_set_id,
+            "topology": topology,
+            "R": float(R),
+            "C": float(C),
+            "L": float(L),
+            "Rload": float(Rload),
+            "A_in": float(A_in),
 
-        for _ in range(n_bin):
-            row = None
+            # Диагностические величины.
+            # Их полезно оставить в df_params.
+            "f0_target": float(f0),
+            "Q_eff_target": float(Q_eff),
+            "R_eq_target": float(R_eq),
+            "R_over_Rload": float(k),
+            "q_bin": int(q_bin),
+        }
 
-            for _try in range(max_resample):
-                f0 = log_uniform(rng, f0_low, f0_high)
-                Q_target = log_uniform(rng, q_low, q_high)
-
-                params = sample_one_rlc_from_target_q(
-                    rng=rng,
-                    f0=f0,
-                    Q_eff=Q_target,
-                )
-
-                if params is None:
-                    continue
-
-                payload = {
-                    "A_in": A_in,
-                    "R": params["R"],
-                    "C": params["C"],
-                    "L": params["L"],
-                    "Rload": params["Rload"],
-                    "fc": np.nan,
-                    "f0": params["f0"],
-                    "Q_eff": params["Q_eff"],
-                    "R_eq": params["R_eq"],
-                    "q_bin_low": q_low,
-                    "q_bin_high": q_high,
-                }
-
-                param_set_id = make_param_set_id(topology, payload)
-
-                row = {
-                    "topology": topology,
-                    "param_set_id": param_set_id,
-                    **payload,
-                }
-                break
-
-            if row is None:
-                skipped += 1
-            else:
-                rows.append(row)
-
-    return rows, skipped
+    raise RuntimeError(
+        f"Could not sample {topology} for q_bin={q_bin} "
+        f"after {max_resample} tries. "
+        "Check RLC ranges or reduce Q range."
+    )
 
 
 def sample_param_sets(
-    n_param_sets_per_topology: int = 400,
+    n_param_sets_per_topology: int = 50,
     f_min: float = 5.0,
     f_max: float = 500.0,
     A_in: float = 1.0,
-    seed: int = 42,
+    max_resample: int = 5000,
+    seed: int | None = None,
 ) -> pd.DataFrame:
     """
-    Генерирует таблицу параметров для всех основных топологий.
+    Сэмплирует параметры схем.
 
-    Возвращает DataFrame, который затем используется для генерации dataset_ac.csv.
+    Для RC/RL первого порядка используется старая логика:
+        выбираем fc_target и один компонент,
+        второй компонент вычисляем из fc.
+
+    Для RLC второго порядка используется новая логика:
+        выбираем f0 и Q_eff,
+        затем вычисляем R, Rload, L, C так,
+        чтобы выбранный Q_eff действительно получился.
+
+    Возвращает DataFrame со столбцами:
+        param_set_id, topology, R, C, L, Rload, A_in,
+        f0_target, Q_eff_target, R_eq_target, R_over_Rload, q_bin
     """
     rng = np.random.default_rng(seed)
 
-    rows: list[dict[str, Any]] = []
+    def log_uniform_pair(rng_pair) -> float:
+        a, b = rng_pair
+        return _log_uniform(rng, a, b)
+
+    def sample_fc_target() -> float:
+        return _log_uniform(rng, f_min, f_max)
+
+    topo_list = [
+        "RC_LP",
+        "RC_HP",
+        "RL_LP",
+        "RL_HP",
+        "RLC_BP",
+        "RLC_NOTCH",
+    ]
+
+    rows: list[dict] = []
     skipped = 0
     used_ids: set[str] = set()
 
-    order1_topologies = ["RC_LP", "RC_HP", "RL_LP", "RL_HP"]
-
-    for topology in order1_topologies:
-        n_ok = 0
-
-        while n_ok < n_param_sets_per_topology:
-            row = _sample_order1_param_set(
-                rng=rng,
-                topology=topology,
-                f_min=f_min,
-                f_max=f_max,
-                A_in=A_in,
+    for topo in topo_list:
+        # ============================================================
+        # RLC: новая генерация с равномерным покрытием q_bin
+        # ============================================================
+        if topo in {"RLC_BP", "RLC_NOTCH"}:
+            counts_per_q_bin = _balanced_counts(
+                n_param_sets_per_topology,
+                len(RLC_Q_BINS),
             )
 
-            if row is None:
+            for q_bin, need in enumerate(counts_per_q_bin):
+                collected_bin = 0
+
+                while collected_bin < need:
+                    try:
+                        row = _sample_one_rlc_from_target_q(
+                            rng,
+                            topology=topo,
+                            f_min=f_min,
+                            f_max=f_max,
+                            A_in=A_in,
+                            q_bin=q_bin,
+                            max_resample=max_resample,
+                        )
+                    except RuntimeError:
+                        skipped += 1
+                        raise
+
+                    if row["param_set_id"] in used_ids:
+                        skipped += 1
+                        continue
+
+                    used_ids.add(row["param_set_id"])
+                    rows.append(row)
+                    collected_bin += 1
+
+            continue
+
+        # ============================================================
+        # RC/RL: твоя старая логика первого порядка
+        # ============================================================
+        collected = 0
+
+        while collected < n_param_sets_per_topology:
+            ok = False
+
+            # ---------------------------
+            # RC, 1-й порядок
+            # ---------------------------
+            if topo in ("RC_LP", "RC_HP"):
+                for _try in range(max_resample):
+                    fc_tgt = sample_fc_target()
+                    R = log_uniform_pair(R_RANGE_OHM)
+
+                    if topo == "RC_LP":
+                        Rload = log_uniform_pair(RLOAD_RANGE_OHM)
+                        R_eq = _r_parallel(R, Rload)
+
+                        if (not np.isfinite(R_eq)) or (R_eq <= 0):
+                            continue
+
+                        # Подбираем C под нужную fc_loaded.
+                        C = 1.0 / (2.0 * math.pi * R_eq * fc_tgt)
+                    else:
+                        Rload = float("nan")
+                        C = 1.0 / (2.0 * math.pi * R * fc_tgt)
+
+                    L = float("nan")
+
+                    if np.isfinite(C) and (C_RANGE_F[0] <= C <= C_RANGE_F[1]):
+                        ok = True
+                        break
+
+            # ---------------------------
+            # RL, 1-й порядок
+            # ---------------------------
+            elif topo in ("RL_LP", "RL_HP"):
+                for _try in range(max_resample):
+                    fc_tgt = sample_fc_target()
+                    R = log_uniform_pair(R_RANGE_OHM)
+
+                    if topo == "RL_HP":
+                        Rload = log_uniform_pair(RLOAD_RANGE_OHM)
+                        R_eq = _r_parallel(R, Rload)
+
+                        if (not np.isfinite(R_eq)) or (R_eq <= 0):
+                            continue
+
+                        # Подбираем L под нужную fc_loaded.
+                        L = R_eq / (2.0 * math.pi * fc_tgt)
+                    else:
+                        Rload = float("nan")
+                        L = R / (2.0 * math.pi * fc_tgt)
+
+                    C = float("nan")
+
+                    if np.isfinite(L) and (L_RANGE_H[0] <= L <= L_RANGE_H[1]):
+                        ok = True
+                        break
+
+            else:
+                raise RuntimeError("Unknown topology")
+
+            if not ok:
                 skipped += 1
                 continue
 
-            param_set_id = row["param_set_id"]
+            param_set_id = make_param_set_id(topo, R, C, L, Rload, A_in)
 
             if param_set_id in used_ids:
                 skipped += 1
                 continue
 
             used_ids.add(param_set_id)
-            rows.append(row)
-            n_ok += 1
 
-    for topology in ["RLC_BP", "RLC_NOTCH"]:
-        rlc_rows, rlc_skipped = _sample_rlc_param_sets_for_topology(
-            rng=rng,
-            topology=topology,
-            n_param_sets=n_param_sets_per_topology,
-            f_min=f_min,
-            f_max=f_max,
-            A_in=A_in,
-        )
+            rows.append({
+                "param_set_id": param_set_id,
+                "topology": topo,
+                "R": float(R),
+                "C": float(C),
+                "L": float(L),
+                "Rload": float(Rload),
+                "A_in": float(A_in),
 
-        skipped += rlc_skipped
+                # Для топологий первого порядка эти поля не применяются.
+                "f0_target": np.nan,
+                "Q_eff_target": np.nan,
+                "R_eq_target": np.nan,
+                "R_over_Rload": np.nan,
+                "q_bin": np.nan,
+            })
 
-        for row in rlc_rows:
-            param_set_id = row["param_set_id"]
+            collected += 1
 
-            if param_set_id in used_ids:
-                skipped += 1
-                continue
+    df_params = pd.DataFrame(rows)
 
-            used_ids.add(param_set_id)
-            rows.append(row)
+    if df_params["param_set_id"].nunique() != len(df_params):
+        raise RuntimeError("Duplicate param_set_id detected")
 
-    df = pd.DataFrame(rows)
+    print(f"[sample_param_sets] sampled={len(df_params)} skipped={skipped}")
 
-    print(f"[sample_param_sets] sampled={len(df)} skipped={skipped}")
+    return df_params
 
-    return df
+
+def seed_from_param_set_id(param_set_id: str, base_seed: int) -> int:
+    """
+    Формирует воспроизводимое целое значение seed по идентификатору набора параметров.
+
+    Используется для детерминированной локальной рандомизации, зависящей от
+    конкретной схемы (param_set_id) и общего базового seed.
+    """
+    return _seed_from_param_set_id(param_set_id, base_seed)
+
+
+def _seed_from_param_set_id(param_set_id: str, base_seed: int) -> int:
+    """
+    Формирует воспроизводимое целое значение seed по идентификатору набора параметров.
+
+    Используется для детерминированной локальной рандомизации, зависящей от
+    конкретной схемы (param_set_id) и общего базового seed.
+    """
+    h = hashlib.blake2b((str(base_seed) + "|" + param_set_id).encode("utf-8"), digest_size=8).digest()
+    return int.from_bytes(h, byteorder="little", signed=False) % (2**32)
+
+
+log_uniform = _log_uniform
+balanced_counts = _balanced_counts
+r_parallel = _r_parallel

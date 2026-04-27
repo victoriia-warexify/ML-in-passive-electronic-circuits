@@ -2,181 +2,141 @@
 
 """
 Генерация dataset_rc_ladder.jsonl для RC ladder.
-
-Модуль строит RC-цепочки по таблице параметров rc_ladder_param_sets.csv,
-выполняет AC-анализ методом МНА и формирует датасет частотных характеристик.
 """
 
 from __future__ import annotations
 
+from collections import Counter
 import json
-from pathlib import Path
-from typing import Any
 
 import numpy as np
 import pandas as pd
 
 from ml_circuits.constants import EPS_LOG
 from ml_circuits.circuits import ac_out_amp_phase, gen_rc_ladder
+from ml_circuits.data_generation.sampling_filters import _seed_from_param_set_id
 from ml_circuits.data_generation.sampling_rc_ladder import make_rc_ladder_freq_grid
-from ml_circuits.io_utils import ensure_parent_dir
-
-
-def _parse_sections_if_needed(sections: Any) -> list[dict[str, float]]:
-    """
-    Приводит описание секций RC ladder к списку словарей.
-
-    При чтении из CSV поле sections может быть строкой JSON.
-    """
-    if isinstance(sections, str):
-        sections = json.loads(sections)
-
-    if not isinstance(sections, list):
-        raise ValueError("sections must be a list or JSON string")
-
-    parsed: list[dict[str, float]] = []
-
-    for sec in sections:
-        if not isinstance(sec, dict):
-            raise ValueError("Each RC ladder section must be a dictionary")
-
-        parsed.append(
-            {
-                "R": float(sec["R"]),
-                "C": float(sec["C"]),
-            }
-        )
-
-    return parsed
 
 
 def generate_rc_ladder_dataset_jsonl(
     df_params: pd.DataFrame,
-    out_path: str | Path | None = None,
-    n_random_freqs: int = 32,
-    n_local_freqs: int = 13,
+    out_jsonl: str = "dataset_rc_ladder.jsonl",
+    *,
     f_min_guard: float = 1e-2,
-    f_max_guard: float = 1e7,
-    seed: int = 42,
-) -> pd.DataFrame:
+    f_max_guard: float = 1e8,
+    dec_span: float = 3.0,
+    n_base: int = 48,
+    jitter_logf: float = 0.015,
+    base_seed: int = 12345,
+) -> list[dict]:
     """
-    Генерирует датасет частотных характеристик для RC ladder.
+    Генерирует датасет для RC_LADDER в формате JSONL.
 
-    Parameters
-    ----------
-    df_params:
-        Таблица параметров, полученная sample_rc_ladder_param_sets.
-    out_path:
-        Путь для сохранения JSONL-файла. Если None, файл не сохраняется.
-    n_random_freqs:
-        Число случайных частотных точек на одну схему.
-    n_local_freqs:
-        Число локальных точек около характерной частоты схемы.
-    f_min_guard, f_max_guard:
-        Глобальные границы допустимого диапазона частот.
-    seed:
-        Seed генератора случайных чисел.
+    Каждая строка JSONL соответствует одной частотной точке одной схемы.
+    Для каждой конфигурации строится индивидуальная частотная сетка,
+    после чего выполняется AC-расчёт и сохраняются вычисленные признаки.
 
-    Returns
-    -------
-    pd.DataFrame
-        Таблица dataset_rc_ladder.jsonl.
+    Возвращает список словарей, записанных в JSONL-файл.
     """
-    required_columns = [
-        "param_set_id",
-        "topology",
-        "n_sections",
-        "sections",
-        "Rload",
-        "A_in",
-    ]
+    required_cols = {"param_set_id", "topology", "n_sections", "sections", "Rload", "A_in"}
+    missing_cols = required_cols - set(df_params.columns)
+    if missing_cols:
+        raise ValueError(
+            f"Во входном DataFrame отсутствуют обязательные столбцы: {sorted(missing_cols)}"
+        )
 
-    missing = [col for col in required_columns if col not in df_params.columns]
-    if missing:
-        raise ValueError(f"В таблице параметров отсутствуют колонки: {missing}")
+    records: list[dict] = []
+    err_counter = Counter()
+    err_examples: list[dict] = []
+    MAX_EXAMPLES = 10
+    skipped = 0
 
-    rows: list[dict[str, Any]] = []
+    with open(out_jsonl, "w", encoding="utf-8") as f_out:
+        for row in df_params.itertuples(index=False):
+            if row.topology != "RC_LADDER":
+                continue
 
-    base_rng = np.random.default_rng(seed)
+            param_seed = _seed_from_param_set_id(row.param_set_id, base_seed)
 
-    for _, row in df_params.iterrows():
-        param_set_id = str(row["param_set_id"])
-        topology = str(row["topology"])
-
-        if topology != "RC_LADDER":
-            raise ValueError(f"Expected topology='RC_LADDER', got {topology}")
-
-        n_sections = int(row["n_sections"])
-        sections = _parse_sections_if_needed(row["sections"])
-        Rload = float(row["Rload"])
-        A_in = float(row["A_in"])
-
-        if n_sections != len(sections):
-            raise ValueError(
-                f"n_sections={n_sections} не совпадает с len(sections)={len(sections)} "
-                f"для param_set_id={param_set_id}"
+            freqs = make_rc_ladder_freq_grid(
+                row.sections,
+                f_min_guard=f_min_guard,
+                f_max_guard=f_max_guard,
+                dec_span=dec_span,
+                n_base=n_base,
+                jitter_logf=jitter_logf,
+                seed=param_seed,
             )
 
-        # Для каждой схемы создаётся отдельный seed, чтобы частотная сетка
-        # была воспроизводимой и не зависела от порядка строк.
-        local_seed = int(base_rng.integers(0, 2**32 - 1))
-        rng = np.random.default_rng(local_seed)
+            for f in freqs:
+                try:
+                    ckt, out_node = gen_rc_ladder(
+                        sections=row.sections,
+                        A_in=float(row.A_in),
+                        Rload=float(row.Rload),
+                    )
 
-        freqs = make_rc_ladder_freq_grid(
-            sections=sections,
-            rng=rng,
-            n_random=n_random_freqs,
-            n_local=n_local_freqs,
-            f_min_guard=f_min_guard,
-            f_max_guard=f_max_guard,
-        )
+                    H_mag, A_out, phi_out = ac_out_amp_phase(
+                        ckt=ckt,
+                        f=float(f),
+                        out_node=int(out_node),
+                        A_in=float(row.A_in),
+                    )
 
-        ckt, out_node = gen_rc_ladder(
-            sections=sections,
-            A_in=A_in,
-            Rload=Rload,
-        )
+                    if (
+                        (not np.isfinite(H_mag)) or
+                        (H_mag < 0) or
+                        (not np.isfinite(A_out)) or
+                        (not np.isfinite(phi_out))
+                    ):
+                        skipped += 1
+                        continue
 
-        for f in freqs:
-            H_mag, A_out, phi_rad = ac_out_amp_phase(
-                ckt=ckt,
-                f=float(f),
-                out_node=out_node,
-                A_in=A_in,
-            )
+                    rec = {
+                        "param_set_id": row.param_set_id,
+                        "topology": "RC_LADDER",
+                        "n_sections": int(row.n_sections),
+                        "sections": [
+                            {"R": float(sec["R"]), "C": float(sec["C"])}
+                            for sec in row.sections
+                        ],
+                        "Rload": float(row.Rload),
+                        "A_in": float(row.A_in),
+                        "frequency_hz": float(f),
+                        "H_mag": float(H_mag),
+                        "log_H_mag": float(np.log(np.clip(H_mag, EPS_LOG, None))),
+                        "A_out": float(A_out),
+                        "phi_rad": float(phi_out),
+                        "phi_sin": float(np.sin(phi_out)),
+                        "phi_cos": float(np.cos(phi_out)),
+                    }
 
-            rec = {
-                "param_set_id": param_set_id,
-                "topology": "RC_LADDER",
-                "n_sections": n_sections,
-                "sections": sections,
-                "Rload": Rload,
-                "A_in": A_in,
-                "frequency_hz": float(f),
-                "H_mag": float(H_mag),
-                "log_H_mag": float(np.log(np.clip(H_mag, EPS_LOG, None))),
-                "A_out": float(A_out),
-                "phi_rad": float(phi_rad),
-                "phi_sin": float(np.sin(phi_rad)),
-                "phi_cos": float(np.cos(phi_rad)),
-            }
+                    f_out.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                    records.append(rec)
 
-            rows.append(rec)
+                except (ValueError, np.linalg.LinAlgError, TypeError, KeyError) as e:
+                    skipped += 1
+                    err_counter[type(e).__name__] += 1
 
-    df = pd.DataFrame(rows)
+                    if len(err_examples) < MAX_EXAMPLES:
+                        err_examples.append({
+                            "param_set_id": row.param_set_id,
+                            "n_sections": int(row.n_sections),
+                            "Rload": float(row.Rload),
+                            "A_in": float(row.A_in),
+                            "frequency_hz": float(f),
+                            "error_type": type(e).__name__,
+                            "error_msg": str(e)[:200],
+                        })
+                    continue
 
-    if out_path is not None:
-        out_path = ensure_parent_dir(out_path)
-        df.to_json(
-            out_path,
-            orient="records",
-            lines=True,
-            force_ascii=False,
-        )
+    print(f"[generate_rc_ladder_dataset_jsonl] wrote {len(records)} rows to {out_jsonl}")
+    if skipped > 0:
+        print("[generate_rc_ladder_dataset_jsonl] skipped:", skipped)
+        print("[generate_rc_ladder_dataset_jsonl] error types:", dict(err_counter))
+        if err_examples:
+            print("[generate_rc_ladder_dataset_jsonl] first error examples:")
+            for ex in err_examples:
+                print(ex)
 
-    print(
-        f"[generate_rc_ladder_dataset_jsonl] generated rows={len(df)} "
-        f"param_sets={df['param_set_id'].nunique() if len(df) else 0}"
-    )
-
-    return df
+    return records

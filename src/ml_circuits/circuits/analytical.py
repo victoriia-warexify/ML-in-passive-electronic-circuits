@@ -16,11 +16,16 @@ import pandas as pd
 
 from ml_circuits.constants import TWO_PI
 
-def parallel_z(z1, z2):
+
+def _parallel_z(z1, z2):
     """
     Эквивалентный импеданс параллельного соединения z1 || z2.
     """
     return 1.0 / (1.0 / z1 + 1.0 / z2)
+
+
+def parallel_z(z1, z2):
+    return _parallel_z(z1, z2)
 
 def analytical_H_for_df(df_part: pd.DataFrame) -> np.ndarray:
     """

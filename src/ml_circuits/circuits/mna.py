@@ -54,12 +54,6 @@ def ac_out_amp_phase(ckt: Circuit, f: float, out_node: int, A_in: float) -> tupl
                 равный arg(Vout / Vin), в радианах.
     """
 
-    if out_node <= 0 or out_node > ckt.N:
-        raise ValueError(f"out_node должен быть в диапазоне [1, {ckt.N}]")
-
-    if not np.isfinite(A_in) or A_in == 0:
-        raise ValueError("A_in должен быть ненулевым конечным числом")
-    
     X = ac_solve_circuit(ckt, f)
 
     # Узловые напряжения: первые Nv элементов соответствуют узлам 1..N
@@ -67,7 +61,7 @@ def ac_out_amp_phase(ckt: Circuit, f: float, out_node: int, A_in: float) -> tupl
     # Входной фазор: амплитуда A_in, начальная фаза 0
     Vin = complex(A_in, 0.0)
 
-    H = Vout / Vin
+    H = Vout / Vin if A_in != 0 else complex(np.nan, np.nan)
     # Модуль передаточной функции и амплитуда выхода
     H_mag = float(np.abs(H))
     A_out = float(np.abs(Vout))

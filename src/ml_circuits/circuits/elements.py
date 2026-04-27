@@ -55,16 +55,7 @@ class Circuit:
         self.inductors.append(Inductor(n1,n2,L))
 
     def add_vsource(self, n_plus: int, A: float) -> None:
-        """Добавляет идеальный источник напряжения между узлом n_plus и землёй."""
-        self._check_node(n_plus)
-
-        if n_plus == 0:
-            raise ValueError("Источник напряжения не может быть подключён только к земле")
-
-        if not np.isfinite(A):
-            raise ValueError("Амплитуда источника должна быть конечной")
-
-        self.vsources.append(VSource(n_plus=n_plus, A=float(A)))
+        self.vsources.append(VSource(n_plus=n_plus, A=A))
     
     # --- Проверка ---
     # номер узла находится в допустимом диапазоне [0, ... , N]
@@ -80,8 +71,7 @@ class Circuit:
 
     @staticmethod
     def _check_pos(x: float, name: str) -> None:
-        if not np.isfinite(x) or x <= 0:
-            raise ValueError(f"{name} должно быть положительным конечным числом")
+        if not (x>0): raise ValueError(f"{name} должно быть > 0")
 
     # --- Подсчёт числа переменных ---
     def variable_sizes(self) -> Tuple[int, int, int]:
