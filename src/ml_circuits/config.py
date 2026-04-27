@@ -96,6 +96,14 @@ CHAR_FREQ_MULTIPLIERS: tuple[float, ...] = (
 )
 
 
+AC_DATASET_GENERATION_CONFIG: dict = {
+    "n_param_sets_per_topology": N_PARAM_SETS_PER_TOPOLOGY,
+    "f_min": F_MIN_DEFAULT,
+    "f_max": F_MAX_DEFAULT,
+    "A_in": A_IN_DEFAULT,
+}
+
+
 # ============================================================
 # Списки топологий
 # ============================================================
@@ -253,6 +261,21 @@ FILTER_TRAINING_CONFIG: dict = {
 # ============================================================
 # RC ladder: параметры запусков
 # ============================================================
+
+RC_LADDER_DATASET_GENERATION_CONFIG: dict = {
+    "n_param_sets_per_n": 400,
+    "section_counts": (1, 2, 3, 4),
+    "A_in": 1.0,
+    "correlated": True,
+    "sigma_logR": 0.20,
+    "sigma_logC": 0.20,
+    "f_min_guard": 1e-2,
+    "f_max_guard": 1e8,
+    "dec_span": 3.0,
+    "n_base": 48,
+    "jitter_logf": 0.015,
+    "base_seed": 12345,
+}
 
 RC_LADDER_DEFAULT_ARTIFACT_DIR: str = "artifacts_rc_ladder_pure_ml_strict_blackbox"
 RC_LADDER_DEFAULT_PLOTS_DIRNAME: str = "plots_rc_ladder"
