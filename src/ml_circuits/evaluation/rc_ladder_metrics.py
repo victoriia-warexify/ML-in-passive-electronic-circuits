@@ -15,6 +15,7 @@ from ml_circuits.features.rc_ladder_features import wrap_angle_deg_np, wrap_angl
 def compute_loss(
     pred: Dict[str, torch.Tensor],
     y_true: torch.Tensor,
+    phase_weight_min: float = 0.02,
     phase_weight_power: float = 0.7,
     phase_loss_scale: float = 0.22,
     angular_loss_scale: float = 0.10,
@@ -29,11 +30,11 @@ def compute_loss(
 
     loss_logH = nn.functional.smooth_l1_loss(pred["logH_per_section"], logH_per_section_true)
 
-    phase_weight = torch.where(
-        H_mag_true >= PHASE_FILTER_MAG,
-        torch.clamp(H_mag_true, min=PHASE_FILTER_MAG, max=1.0) ** phase_weight_power,
-        torch.zeros_like(H_mag_true),
-    )
+    phase_weight = torch.clamp(
+        H_mag_true,
+        min=phase_weight_min,
+        max=1.0,
+    ) ** phase_weight_power
 
     loss_sin = nn.functional.smooth_l1_loss(pred["sin_phi"], sin_true, reduction="none")
     loss_cos = nn.functional.smooth_l1_loss(pred["cos_phi"], cos_true, reduction="none")

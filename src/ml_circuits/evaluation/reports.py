@@ -198,12 +198,24 @@ def summarize_all_rc_ladder_runs() -> pd.DataFrame:
             print(f"[WARN] В файле {path} отсутствуют столбцы: {missing}")
             continue
 
-        best_row = df.sort_values(
-            by=[
-                "score",
+        score_col = "selection_score" if "selection_score" in df.columns else "score"
+        if score_col == "score":
+            print(
+                f"[WARN] {path} не содержит selection_score; используется старый fallback score. "
+                "Перезапустите RC-ladder обучение, чтобы выбирать seed по validation."
+            )
+        tie_breakers = [
+            c for c in [
+                "val_dB_MAE_group_weighted",
+                "val_phi_MAE_filtered_deg_group_weighted",
                 "test_dB_MAE_group_weighted",
                 "test_phi_MAE_filtered_deg_group_weighted",
             ]
+            if c in df.columns
+        ]
+
+        best_row = df.sort_values(
+            by=[score_col, *tie_breakers]
         ).iloc[0]
 
         rows.append(
@@ -211,13 +223,14 @@ def summarize_all_rc_ladder_runs() -> pd.DataFrame:
                 "mode": mode,
                 "n_seeds": len(df),
                 "best_seed": int(best_row["seed"]),
-                "best_score": float(best_row["score"]),
+                "best_score": float(best_row[score_col]),
+                "selection_score_source": score_col,
                 "best_test_dB_MAE": float(best_row["test_dB_MAE"]),
                 "best_test_phi_MAE_filtered_deg": float(best_row["test_phi_MAE_filtered_deg"]),
                 "best_test_phi_MAE_deg": float(best_row["test_phi_MAE_deg"]),
                 "best_test_logH_MAE": float(best_row["test_logH_MAE"]),
-                "mean_score": float(df["score"].mean()),
-                "std_score": float(df["score"].std(ddof=0)),
+                "mean_score": float(df[score_col].mean()),
+                "std_score": float(df[score_col].std(ddof=0)),
                 "mean_test_dB_MAE": float(df["test_dB_MAE"].mean()),
                 "std_test_dB_MAE": float(df["test_dB_MAE"].std(ddof=0)),
                 "mean_test_phi_MAE_filtered_deg": float(df["test_phi_MAE_filtered_deg"].mean()),

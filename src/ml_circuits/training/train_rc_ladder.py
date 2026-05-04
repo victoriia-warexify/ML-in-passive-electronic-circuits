@@ -224,6 +224,7 @@ def run_epoch(
     loader: DataLoader,
     optimizer: torch.optim.Optimizer | None,
     device: torch.device,
+    phase_weight_min: float,
     phase_weight_power: float,
     phase_loss_scale: float,
     angular_loss_scale: float,
@@ -246,6 +247,7 @@ def run_epoch(
             loss = compute_loss(
                 pred,
                 y_true=y,
+                phase_weight_min=phase_weight_min,
                 phase_weight_power=phase_weight_power,
                 phase_loss_scale=phase_loss_scale,
                 angular_loss_scale=angular_loss_scale,
@@ -262,13 +264,14 @@ def run_epoch(
                     seq_len=seq_len,
                     global_feat=global_feat,
                 )
-                loss = compute_loss(
-                    pred,
-                    y_true=y,
-                    phase_weight_power=phase_weight_power,
-                    phase_loss_scale=phase_loss_scale,
-                    angular_loss_scale=angular_loss_scale,
-                )
+            loss = compute_loss(
+                pred,
+                y_true=y,
+                phase_weight_min=phase_weight_min,
+                phase_weight_power=phase_weight_power,
+                phase_loss_scale=phase_loss_scale,
+                angular_loss_scale=angular_loss_scale,
+            )
 
         losses.append(float(loss.detach().cpu().item()))
 
@@ -284,6 +287,7 @@ def train_model(
     weight_decay: float = 1e-5,
     epochs: int = 150,
     patience: int = 20,
+    phase_weight_min: float = 0.02,
     phase_weight_power: float = 0.7,
     phase_loss_scale: float = 0.22,
     angular_loss_scale: float = 0.10,
@@ -302,11 +306,11 @@ def train_model(
     for epoch in range(1, epochs + 1):
         train_loss = run_epoch(
             model, train_loader, optimizer, device,
-            phase_weight_power, phase_loss_scale, angular_loss_scale,
+            phase_weight_min, phase_weight_power, phase_loss_scale, angular_loss_scale,
         )
         val_loss = run_epoch(
             model, val_loader, None, device,
-            phase_weight_power, phase_loss_scale, angular_loss_scale,
+            phase_weight_min, phase_weight_power, phase_loss_scale, angular_loss_scale,
         )
 
         history["train_loss"].append(train_loss)
@@ -382,6 +386,7 @@ def train_one_seed(
         weight_decay=args.weight_decay,
         epochs=args.epochs,
         patience=args.patience,
+        phase_weight_min=args.phase_weight_min,
         phase_weight_power=args.phase_weight_power,
         phase_loss_scale=args.phase_loss_scale,
         angular_loss_scale=args.angular_loss_scale,
@@ -391,16 +396,12 @@ def train_one_seed(
     print("=== METRICS ===")
     train_metrics = evaluate_metrics(model, train_loader, device)
     val_metrics = evaluate_metrics(model, val_loader, device)
-    test_metrics = evaluate_metrics(model, test_loader, device)
-
-    test_name = "test_extrapolation_n4" if args.mode == "strict" else "test_n4_remaining"
 
     format_metrics("train", train_metrics)
     format_metrics("val", val_metrics)
-    format_metrics(test_name, test_metrics)
 
-    predictions_test_df = predict_loader_to_df(model, test_loader, device)
-    test_metrics_group_weighted = evaluate_predictions_df_group_weighted(predictions_test_df)
+    predictions_val_df = predict_loader_to_df(model, val_loader, device)
+    val_metrics_group_weighted = evaluate_predictions_df_group_weighted(predictions_val_df)
 
     return {
         "seed": seed,
@@ -410,10 +411,10 @@ def train_one_seed(
         "stats": stats,
         "train_metrics": train_metrics,
         "val_metrics": val_metrics,
-        "test_metrics": test_metrics,
-        "test_metrics_group_weighted": test_metrics_group_weighted,
-        "pred_test_df": predictions_test_df,
-        "score": combined_score_group_weighted(test_metrics_group_weighted),
+        "val_metrics_group_weighted": val_metrics_group_weighted,
+        "pred_val_df": predictions_val_df,
+        "test_loader": test_loader,
+        "selection_score": combined_score_group_weighted(val_metrics_group_weighted),
     }
 
 
@@ -435,6 +436,7 @@ def run_rc_ladder_experiment(
     patience: int = 20,
     val_fraction: float = 0.15,
     max_sections: int = 4,
+    phase_weight_min: float = 0.02,
     phase_weight_power: float = 0.70,
     phase_loss_scale: float = 0.22,
     angular_loss_scale: float = 0.10,
@@ -458,6 +460,7 @@ def run_rc_ladder_experiment(
         patience=patience,
         val_fraction=val_fraction,
         max_sections=max_sections,
+        phase_weight_min=phase_weight_min,
         phase_weight_power=phase_weight_power,
         phase_loss_scale=phase_loss_scale,
         angular_loss_scale=angular_loss_scale,
@@ -491,34 +494,74 @@ def run_rc_ladder_experiment(
 
     leaderboard_rows = []
     for result in results:
-        test_metrics = result["test_metrics"]
-        test_metrics_gw = result["test_metrics_group_weighted"]
+        val_metrics = result["val_metrics"]
+        val_metrics_gw = result["val_metrics_group_weighted"]
 
         leaderboard_rows.append(
             {
                 "seed": result["seed"],
-                "score": result["score"],
-                "test_dB_MAE": test_metrics["dB_MAE"],
-                "test_phi_MAE_filtered_deg": test_metrics["phi_MAE_filtered_deg"],
-                "test_phi_MAE_deg": test_metrics["phi_MAE_deg"],
-                "test_logH_MAE": test_metrics["logH_MAE"],
-                "test_dB_MAE_group_weighted": test_metrics_gw["dB_MAE_group_weighted"],
-                "test_dB_RMSE_group_weighted": test_metrics_gw["dB_RMSE_group_weighted"],
-                "test_phi_MAE_filtered_deg_group_weighted": test_metrics_gw["phi_MAE_filtered_deg_group_weighted"],
-                "test_phi_MAE_deg_group_weighted": test_metrics_gw["phi_MAE_deg_group_weighted"],
-                "test_logH_MAE_group_weighted": test_metrics_gw["logH_MAE_group_weighted"],
+                # score оставлен как backward-compatible alias для validation selection score.
+                "score": result["selection_score"],
+                "selection_score": result["selection_score"],
+                "selection_metric": "validation_group_weighted",
+                "val_dB_MAE": val_metrics["dB_MAE"],
+                "val_phi_MAE_filtered_deg": val_metrics["phi_MAE_filtered_deg"],
+                "val_phi_MAE_deg": val_metrics["phi_MAE_deg"],
+                "val_logH_MAE": val_metrics["logH_MAE"],
+                "val_dB_MAE_group_weighted": val_metrics_gw["dB_MAE_group_weighted"],
+                "val_dB_RMSE_group_weighted": val_metrics_gw["dB_RMSE_group_weighted"],
+                "val_phi_MAE_filtered_deg_group_weighted": val_metrics_gw["phi_MAE_filtered_deg_group_weighted"],
+                "val_phi_MAE_deg_group_weighted": val_metrics_gw["phi_MAE_deg_group_weighted"],
+                "val_logH_MAE_group_weighted": val_metrics_gw["logH_MAE_group_weighted"],
             }
         )
 
     leaderboard_df = pd.DataFrame(leaderboard_rows).sort_values(
-        by=["score", "test_dB_MAE", "test_phi_MAE_filtered_deg"]
+        by=[
+            "selection_score",
+            "val_dB_MAE_group_weighted",
+            "val_phi_MAE_filtered_deg_group_weighted",
+        ]
     ).reset_index(drop=True)
 
-    print("=== LEADERBOARD (lower is better) ===")
+    print("=== LEADERBOARD BY VALIDATION SCORE (lower is better) ===")
     print(leaderboard_df.to_string(index=False))
 
     best_seed = int(leaderboard_df.iloc[0]["seed"])
     best_result = next(result for result in results if result["seed"] == best_seed)
+
+    test_name = "test_extrapolation_n4" if args.mode == "strict" else "test_n4_remaining"
+    print("=== FINAL TEST METRICS FOR VALIDATION-SELECTED SEED ===")
+    test_metrics = evaluate_metrics(best_result["model"], best_result["test_loader"], device)
+    format_metrics(test_name, test_metrics)
+    predictions_test_df = predict_loader_to_df(
+        best_result["model"],
+        best_result["test_loader"],
+        device,
+    )
+    test_metrics_group_weighted = evaluate_predictions_df_group_weighted(predictions_test_df)
+
+    test_columns = {
+        "test_dB_MAE": test_metrics["dB_MAE"],
+        "test_phi_MAE_filtered_deg": test_metrics["phi_MAE_filtered_deg"],
+        "test_phi_MAE_deg": test_metrics["phi_MAE_deg"],
+        "test_logH_MAE": test_metrics["logH_MAE"],
+        "test_dB_MAE_group_weighted": test_metrics_group_weighted["dB_MAE_group_weighted"],
+        "test_dB_RMSE_group_weighted": test_metrics_group_weighted["dB_RMSE_group_weighted"],
+        "test_phi_MAE_filtered_deg_group_weighted": test_metrics_group_weighted["phi_MAE_filtered_deg_group_weighted"],
+        "test_phi_MAE_deg_group_weighted": test_metrics_group_weighted["phi_MAE_deg_group_weighted"],
+        "test_logH_MAE_group_weighted": test_metrics_group_weighted["logH_MAE_group_weighted"],
+    }
+    for column in test_columns:
+        leaderboard_df[column] = np.nan
+    selected_mask = leaderboard_df["seed"] == best_seed
+    for column, value in test_columns.items():
+        leaderboard_df.loc[selected_mask, column] = value
+
+    leaderboard_rows = leaderboard_df.to_dict(orient="records")
+    best_result["test_metrics"] = test_metrics
+    best_result["test_metrics_group_weighted"] = test_metrics_group_weighted
+    best_result["pred_test_df"] = predictions_test_df
 
     model_path = os.path.join(artifact_dir, f"best_model_seed_{best_seed}.pt")
     torch.save(best_result["model"].state_dict(), model_path)
@@ -534,10 +577,15 @@ def run_rc_ladder_experiment(
 
     payload = {
         "best_seed": best_seed,
+        "best_seed_selection_rule": (
+            "min validation group-weighted score; test metrics are reported only "
+            "for the selected seed"
+        ),
         "leaderboard": leaderboard_rows,
         "best_epoch": best_result["best_epoch"],
         "train": best_result["train_metrics"],
         "val": best_result["val_metrics"],
+        "val_group_weighted": best_result["val_metrics_group_weighted"],
         "history": best_result["history"],
         "config": vars(args),
         "stats": best_result["stats"],

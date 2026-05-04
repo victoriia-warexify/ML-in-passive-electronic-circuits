@@ -121,10 +121,20 @@ def build_group_summary(predictions_df: pd.DataFrame) -> pd.DataFrame:
 def choose_representative_groups(
     predictions_df: pd.DataFrame,
     num_groups: int,
+    group_ids: List[str] | None = None,
 ) -> List[str]:
     """
     Выбирает несколько характерных групп param_set_id для построения частотных характеристик.
     """
+    if group_ids is not None:
+        available = set(predictions_df["param_set_id"].astype(str).unique())
+        selected = [group_id for group_id in group_ids if group_id in available]
+        missing = [group_id for group_id in group_ids if group_id not in available]
+        if missing:
+            print(f"[WARN] Bode group_id отсутствуют в predictions CSV: {missing}")
+        if selected:
+            return selected
+
     summary_df = build_group_summary(predictions_df)
 
     if summary_df.empty:
@@ -142,11 +152,21 @@ def plot_bode_examples(
     predictions_df: pd.DataFrame,
     output_dir: str,
     num_groups: int = 3,
+    group_ids: List[str] | None = None,
 ) -> None:
     """
     Строит несколько характерных Bode-графиков для отдельных RC-цепочек.
     """
-    selected_group_ids = choose_representative_groups(predictions_df, num_groups=num_groups)
+    ensure_dir(output_dir)
+    for file_name in os.listdir(output_dir):
+        if file_name.startswith("bode_example_") and file_name.endswith(".png"):
+            os.remove(os.path.join(output_dir, file_name))
+
+    selected_group_ids = choose_representative_groups(
+        predictions_df,
+        num_groups=num_groups,
+        group_ids=group_ids,
+    )
 
     for plot_idx, group_id in enumerate(selected_group_ids, start=1):
         group_df = predictions_df[predictions_df["param_set_id"] == group_id].copy()

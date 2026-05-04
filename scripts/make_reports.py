@@ -16,6 +16,17 @@ from ml_circuits.visualization.rc_ladder_plots import (
 )
 
 
+NOTEBOOK_BODE_GROUP_IDS_BY_MODE = {
+    # Эти группы соответствуют Bode-примерам из rc_ladder_model.ipynb
+    # для strict black-box эксперимента.
+    "strict_extrapolation": [
+        "8710d35cee57",
+        "84b2f5533d5e",
+        "65bafebbc9ff",
+    ],
+}
+
+
 def main() -> None:
     for cfg in RUN_CONFIGS:
         artifact_dir = cfg["artifact_dir"]
@@ -34,8 +45,24 @@ def main() -> None:
         ensure_dir(plots_dir)
 
         leaderboard_df = pd.read_csv(leaderboard_path)
+        score_col = "selection_score" if "selection_score" in leaderboard_df.columns else "score"
+        if score_col == "score":
+            print(
+                f"[WARN] {leaderboard_path} не содержит selection_score; "
+                "используется старый fallback score. Перезапустите RC-ladder обучение, "
+                "чтобы выбирать seed по validation."
+            )
+        tie_breakers = [
+            c for c in [
+                "val_dB_MAE_group_weighted",
+                "val_phi_MAE_filtered_deg_group_weighted",
+                "test_dB_MAE",
+                "test_phi_MAE_filtered_deg",
+            ]
+            if c in leaderboard_df.columns
+        ]
         best_row = leaderboard_df.sort_values(
-            by=["score", "test_dB_MAE", "test_phi_MAE_filtered_deg"]
+            by=[score_col, *tie_breakers]
         ).iloc[0]
         best_seed = int(best_row["seed"])
 
@@ -55,6 +82,7 @@ def main() -> None:
             predictions_df=predictions_df,
             output_dir=plots_dir,
             num_groups=3,
+            group_ids=NOTEBOOK_BODE_GROUP_IDS_BY_MODE.get(cfg["mode_name"]),
         )
 
         plot_error_vs_frequency(
