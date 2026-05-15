@@ -29,7 +29,14 @@ def get_rload_eff(Rload: np.ndarray, open_r: float = OPEN_R):
 def make_features_rc_hp(df: pd.DataFrame):
     """
     Формирует признаки для топологии RC_HP
-    (высокочастотный фильтр первого порядка без нагрузки).
+    (высокочастотный RC-фильтр первого порядка без нагрузки).
+
+    Схема: Vs -> C -> out, R(out) -> GND.
+    Передаточная функция:
+        H(jω) = jωRC / (1 + jωRC).
+
+    Используемый признак:
+        - log10(f / fc), где fc = 1 / (2πRC).
     """
     if not set(df["topology"].unique()).issubset({"RC_HP"}):
         raise ValueError("make_features_rc_hp() expects only RC_HP")
@@ -40,16 +47,12 @@ def make_features_rc_hp(df: pd.DataFrame):
     C = df["C"].to_numpy(dtype=float)
 
     f_safe = np.clip(f, EPS_F, None)
-
-    log_R = safe_log(R)
-    log_C = safe_log(C)
-
     tau = np.clip(R * C, EPS_NORM, None)
     fc = 1.0 / (2.0 * np.pi * tau)
     log10_f_norm = np.log10(f_safe / np.clip(fc, EPS_F, None))
 
-    num_cols = ["log10_f_norm", "log_R", "log_C"]
-    X = np.vstack([log10_f_norm, log_R, log_C]).T.astype(float, copy=False)
+    num_cols = ["log10_f_norm"]
+    X = log10_f_norm.reshape(-1, 1).astype(float, copy=False)
 
     if X.shape[1] != len(num_cols):
         raise ValueError("Feature matrix width does not match num_cols")
@@ -59,7 +62,19 @@ def make_features_rc_hp(df: pd.DataFrame):
 def make_features_rc_lp(df: pd.DataFrame):
     """
     Формирует признаки для топологии RC_LP
-    (низкочастотный фильтр первого порядка с возможной нагрузкой).
+    (низкочастотный RC-фильтр первого порядка с возможной нагрузкой).
+
+    Схема: Vs -> R -> out, C(out) -> GND, опционально Rload(out) -> GND.
+    Передаточная функция:
+        H(jω) = Zp / (R + Zp),
+    где
+        Zp = (1 / jωC) || Rload.
+
+    Используемые признаки:
+        - log10(f / fc_loaded), где fc_loaded = 1 / (2π (R || Rload_eff) C);
+        - ln(dc_gain), где dc_gain = Rload / (R + Rload) при наличии нагрузки
+          и 1 при её отсутствии;
+        - has_Rload.
     """
     if not set(df["topology"].unique()).issubset({"RC_LP"}):
         raise ValueError("make_features_rc_lp() expects only RC_LP")
@@ -71,12 +86,7 @@ def make_features_rc_lp(df: pd.DataFrame):
     Rload = df["Rload"].to_numpy(dtype=float)
 
     f_safe = np.clip(f, EPS_F, None)
-
     has_Rload, Rload_eff = get_rload_eff(Rload)
-
-    log_R = safe_log(R)
-    log_C = safe_log(C)
-    log_Rload_eff = safe_log(Rload_eff)
 
     m_rc = (
         np.isfinite(f) & (f > 0.0) &
@@ -99,11 +109,9 @@ def make_features_rc_lp(df: pd.DataFrame):
 
     log10_f_norm_loaded = np.full_like(f_safe, np.nan, dtype=float)
     if np.any(m_rc):
-        log10_f_norm_loaded[m_rc] = np.log10(f_safe[m_rc] / np.clip(fc_loaded[m_rc], EPS_F, None))
-
-    log_R_over_Rload_eff = np.full_like(log_R, np.nan, dtype=float)
-    m_rr = m_loaded & np.isfinite(log_R) & np.isfinite(log_Rload_eff)
-    log_R_over_Rload_eff[m_rr] = log_R[m_rr] - log_Rload_eff[m_rr]
+        log10_f_norm_loaded[m_rc] = np.log10(
+            f_safe[m_rc] / np.clip(fc_loaded[m_rc], EPS_F, None)
+        )
 
     dc_gain = np.full_like(R, np.nan, dtype=float)
     if np.any(m_loaded):
@@ -117,26 +125,14 @@ def make_features_rc_lp(df: pd.DataFrame):
     if np.any(m_open):
         log_dc_gain[m_open] = 0.0
 
-    w = 2.0 * np.pi * f_safe
-    Zc_mag = 1.0 / np.clip(w * C, EPS_NORM, None)
-    log_Zc_over_Rpar = safe_log(Zc_mag) - safe_log(Rpar)
-
     num_cols = [
         "log10_f_norm_loaded",
-        "log_R", "log_C",
-        "log_Rload_eff",
-        "log_R_over_Rload_eff",
         "log_dc_gain",
-        "log_Zc_over_Rpar",
         "has_Rload",
     ]
     X = np.vstack([
         log10_f_norm_loaded,
-        log_R, log_C,
-        log_Rload_eff,
-        log_R_over_Rload_eff,
         log_dc_gain,
-        log_Zc_over_Rpar,
         has_Rload,
     ]).T.astype(float, copy=False)
 
@@ -148,7 +144,20 @@ def make_features_rc_lp(df: pd.DataFrame):
 def make_features_rl_hp(df: pd.DataFrame):
     """
     Формирует признаки для топологии RL_HP
-    (высокочастотный фильтр первого порядка с возможной нагрузкой).
+    (высокочастотный RL-фильтр первого порядка с возможной нагрузкой).
+
+    Схема: Vs -> R -> out, L(out) -> GND, опционально Rload(out) -> GND.
+    Передаточная функция:
+        H(jω) = Zp / (R + Zp),
+    где
+        Zp = (jωL) || Rload.
+
+    Используемые признаки:
+        - log10(f / fc_req), где fc_req = Req / (2πL), Req = R || Rload_eff;
+        - log10(f / fc_r), где fc_r = R / (2πL);
+        - ln(hf_gain), где hf_gain = Rload / (R + Rload) при наличии нагрузки
+          и 1 при её отсутствии;
+        - has_Rload.
     """
     if not set(df["topology"].unique()).issubset({"RL_HP"}):
         raise ValueError("make_features_rl_hp() expects only RL_HP")
@@ -160,12 +169,7 @@ def make_features_rl_hp(df: pd.DataFrame):
     Rload = df["Rload"].to_numpy(dtype=float)
 
     f_safe = np.clip(f, EPS_F, None)
-
     has_Rload, Rload_eff = get_rload_eff(Rload)
-
-    log_R = safe_log(R)
-    log_L = safe_log(L)
-    log_Rload_eff = safe_log(Rload_eff)
 
     m_rl = (
         np.isfinite(f) & (f > 0.0) &
@@ -181,29 +185,25 @@ def make_features_rl_hp(df: pd.DataFrame):
         Rl_safe = np.clip(Rload_eff[m_rl], R_FLOOR_OHM, None)
         Req[m_rl] = 1.0 / (1.0 / R_safe + 1.0 / Rl_safe)
 
-    tau_eff = np.full_like(R, np.nan, dtype=float)
-    if np.any(m_rl):
-        tau_eff[m_rl] = L[m_rl] / np.clip(Req[m_rl], EPS_NORM, None)
-    log_tau_rl_eff = safe_log(tau_eff)
-
     fc_req = np.full_like(R, np.nan, dtype=float)
     if np.any(m_rl):
         fc_req[m_rl] = Req[m_rl] / (2.0 * np.pi * np.clip(L[m_rl], EPS_NORM, None))
+
     log10_f_norm_req = np.full_like(f_safe, np.nan, dtype=float)
     if np.any(m_rl):
-        log10_f_norm_req[m_rl] = np.log10(f_safe[m_rl] / np.clip(fc_req[m_rl], EPS_F, None))
+        log10_f_norm_req[m_rl] = np.log10(
+            f_safe[m_rl] / np.clip(fc_req[m_rl], EPS_F, None)
+        )
 
     fc_r = np.full_like(R, np.nan, dtype=float)
     if np.any(m_rl):
         fc_r[m_rl] = R[m_rl] / (2.0 * np.pi * np.clip(L[m_rl], EPS_NORM, None))
+
     log10_f_norm_r = np.full_like(f_safe, np.nan, dtype=float)
     if np.any(m_rl):
-        log10_f_norm_r[m_rl] = np.log10(f_safe[m_rl] / np.clip(fc_r[m_rl], EPS_F, None))
-
-    m_rr = np.isfinite(R) & (R > 0.0) & np.isfinite(Rload_eff) & (Rload_eff > 0.0)
-    log_R_over_Rload_eff = np.full_like(log_R, np.nan, dtype=float)
-    if np.any(m_rr):
-        log_R_over_Rload_eff[m_rr] = log_R[m_rr] - log_Rload_eff[m_rr]
+        log10_f_norm_r[m_rl] = np.log10(
+            f_safe[m_rl] / np.clip(fc_r[m_rl], EPS_F, None)
+        )
 
     hf_gain = np.full_like(R, np.nan, dtype=float)
     if np.any(m_loaded):
@@ -220,19 +220,12 @@ def make_features_rl_hp(df: pd.DataFrame):
     num_cols = [
         "log10_f_norm_req",
         "log10_f_norm_r",
-        "log_R", "log_L", "log_Rload_eff",
-        "log_tau_rl_eff",
-        "log_R_over_Rload_eff",
         "log_hf_gain",
         "has_Rload",
     ]
-
     X = np.vstack([
         log10_f_norm_req,
         log10_f_norm_r,
-        log_R, log_L, log_Rload_eff,
-        log_tau_rl_eff,
-        log_R_over_Rload_eff,
         log_hf_gain,
         has_Rload,
     ]).T.astype(float, copy=False)
@@ -245,7 +238,14 @@ def make_features_rl_hp(df: pd.DataFrame):
 def make_features_rl_lp(df: pd.DataFrame):
     """
     Формирует признаки для топологии RL_LP
-    (низкочастотный фильтр первого порядка без нагрузки).
+    (низкочастотный RL-фильтр первого порядка без нагрузки).
+
+    Схема: Vs -> L -> out, R(out) -> GND.
+    Передаточная функция:
+        H(jω) = R / (R + jωL).
+
+    Используемый признак:
+        - log10(f / fc), где fc = R / (2πL).
     """
     if not set(df["topology"].unique()).issubset({"RL_LP"}):
         raise ValueError("make_features_rl_lp() expects only RL_LP")
@@ -257,19 +257,11 @@ def make_features_rl_lp(df: pd.DataFrame):
 
     f_safe = np.clip(f, EPS_F, None)
 
-    log_R = safe_log(R)
-    log_L = safe_log(L)
-
     m_rl = (
         np.isfinite(f) & (f > 0.0) &
         np.isfinite(R) & (R > 0.0) &
         np.isfinite(L) & (L > 0.0)
     )
-
-    tau = np.full_like(R, np.nan, dtype=float)
-    if np.any(m_rl):
-        tau[m_rl] = L[m_rl] / np.clip(R[m_rl], R_FLOOR_OHM, None)
-    log_tau_rl = safe_log(tau)
 
     fc = np.full_like(R, np.nan, dtype=float)
     if np.any(m_rl):
@@ -279,8 +271,8 @@ def make_features_rl_lp(df: pd.DataFrame):
     if np.any(m_rl):
         log10_f_norm[m_rl] = np.log10(f_safe[m_rl] / np.clip(fc[m_rl], EPS_F, None))
 
-    num_cols = ["log10_f_norm", "log_R", "log_L", "log_tau_rl"]
-    X = np.vstack([log10_f_norm, log_R, log_L, log_tau_rl]).T.astype(float, copy=False)
+    num_cols = ["log10_f_norm"]
+    X = log10_f_norm.reshape(-1, 1).astype(float, copy=False)
 
     if X.shape[1] != len(num_cols):
         raise ValueError("Feature matrix width does not match num_cols")
@@ -296,18 +288,34 @@ def _r_parallel(a: np.ndarray, b: np.ndarray) -> np.ndarray:
 
 def make_features_rlc_bp(df: pd.DataFrame):
     """
-    Компактные физически-информированные признаки для новой RLC_BP.
+    Формирует физически-информированные признаки для топологии RLC_BP.
+
+    В текущей постановке под RLC_BP понимается резонансная RLC-схема,
+    для которой используются компактные безразмерные признаки,
+    характеризующие положение частоты относительно резонанса,
+    эффективную добротность и степень расстройки LC-ветви.
+
+    Используемые признаки:
+        - log10(f / f0), где f0 — характерная частота LC-звена;
+        - ln(Q_eff), где Q_eff — эффективная добротность;
+        - ln(|X_LC| / R_eq), где
+              X_LC = ωL - 1 / (ωC),
+              R_eq = R || Rload.
+
+    Параметры f0 и Q_eff берутся из DataFrame, если соответствующие столбцы
+    уже присутствуют в датасете. В противном случае они вычисляются
+    непосредственно по параметрам схемы.
     """
     if not set(df["topology"].unique()).issubset({"RLC_BP"}):
         raise ValueError("make_features_rlc_bp() expects only RLC_BP")
 
     _require_cols(df, ["f", "R", "L", "C", "Rload"], "make_features_rlc_bp")
 
-    f = df["f"].to_numpy(float)
-    R = df["R"].to_numpy(float)
-    L = df["L"].to_numpy(float)
-    C = df["C"].to_numpy(float)
-    Rload = df["Rload"].to_numpy(float)
+    f = df["f"].to_numpy(dtype=float)
+    R = df["R"].to_numpy(dtype=float)
+    L = df["L"].to_numpy(dtype=float)
+    C = df["C"].to_numpy(dtype=float)
+    Rload = df["Rload"].to_numpy(dtype=float)
 
     f_safe = np.clip(f, EPS_F, None)
     R_safe = np.clip(R, R_FLOOR_OHM, None)
@@ -318,40 +326,24 @@ def make_features_rlc_bp(df: pd.DataFrame):
     Rload_eff_safe = np.clip(Rload_eff, R_FLOOR_OHM, None)
 
     if "f0" in df.columns:
-        f0 = df["f0"].to_numpy(float)
+        f0 = df["f0"].to_numpy(dtype=float)
     else:
         f0 = 1.0 / (2.0 * np.pi * np.sqrt(np.clip(L_safe * C_safe, EPS_NORM, None)))
 
     R_eq = _r_parallel(R_safe, Rload_eff_safe)
 
     if "Q_eff" in df.columns:
-        Q_eff = df["Q_eff"].to_numpy(float)
+        Q_eff = df["Q_eff"].to_numpy(dtype=float)
     else:
-        Q_eff = np.sqrt(np.clip(L_safe / C_safe, EPS_NORM, None)) / np.clip(R_eq, R_FLOOR_OHM, None)
-
-    if "f1" in df.columns:
-        f1 = df["f1"].to_numpy(float)
-    else:
-        alpha = np.sqrt(1.0 + 4.0 * Q_eff * Q_eff)
-        f1 = f0 * (alpha - 1.0) / (2.0 * Q_eff)
-
-    if "f2" in df.columns:
-        f2 = df["f2"].to_numpy(float)
-    else:
-        alpha = np.sqrt(1.0 + 4.0 * Q_eff * Q_eff)
-        f2 = f0 * (alpha + 1.0) / (2.0 * Q_eff)
+        Q_eff = (
+            np.sqrt(np.clip(L_safe / C_safe, EPS_NORM, None))
+            / np.clip(R_eq, R_FLOOR_OHM, None)
+        )
 
     f0_safe = np.clip(f0, EPS_F, None)
-    f1_safe = np.clip(f1, EPS_F, None)
-    f2_safe = np.clip(f2, EPS_F, None)
-
     log10_f_norm = np.log10(f_safe / f0_safe)
-    log10_f_over_f1 = np.log10(f_safe / f1_safe)
-    log10_f_over_f2 = np.log10(f_safe / f2_safe)
 
     log_Q_eff = safe_log(np.clip(Q_eff, EPS_NORM, None))
-
-    log_R_over_Rload = safe_log(R_safe) - safe_log(Rload_eff_safe)
 
     w = 2.0 * np.pi * f_safe
     X_lc = w * L_safe - 1.0 / np.clip(w * C_safe, EPS_NORM, None)
@@ -363,23 +355,18 @@ def make_features_rlc_bp(df: pd.DataFrame):
 
     num_cols = [
         "log10_f_norm",
-        "log10_f_over_f1",
-        "log10_f_over_f2",
         "log_Q_eff",
-        "log_R_over_Rload",
         "log_abs_X_lc_over_R_eq",
     ]
 
     X = np.vstack([
         log10_f_norm,
-        log10_f_over_f1,
-        log10_f_over_f2,
         log_Q_eff,
-        log_R_over_Rload,
         log_abs_X_lc_over_R_eq,
     ]).T.astype(float, copy=False)
 
-    assert X.shape[1] == len(num_cols)
+    if X.shape[1] != len(num_cols):
+        raise ValueError("Feature matrix width does not match num_cols")
 
     if not np.isfinite(X).all():
         bad = np.where(~np.isfinite(X))
@@ -393,18 +380,31 @@ def make_features_rlc_bp(df: pd.DataFrame):
 
 def make_features_rlc_notch(df: pd.DataFrame):
     """
-    Компактные физически-информированные признаки для RLC_NOTCH.
+    Формирует физически-информированные признаки для топологии RLC_NOTCH.
+
+    Используемые признаки:
+        - log10(f / f0), где f0 — характерная частота LC-звена;
+        - ln(Q_eff), где Q_eff — эффективная добротность;
+        - ln(pass_gain), где pass_gain ≈ Rload / (R + Rload);
+        - ln(R / Rload);
+        - ln(|X_LC| / R_eq), где
+              X_LC = ωL - 1 / (ωC),
+              R_eq = R || Rload.
+
+    Параметры f0 и Q_eff берутся из DataFrame, если соответствующие столбцы
+    уже присутствуют в датасете. В противном случае они вычисляются
+    непосредственно по параметрам схемы.
     """
     if not set(df["topology"].unique()).issubset({"RLC_NOTCH"}):
         raise ValueError("make_features_rlc_notch() expects only RLC_NOTCH")
 
     _require_cols(df, ["f", "R", "L", "C", "Rload"], "make_features_rlc_notch")
 
-    f = df["f"].to_numpy(float)
-    R = df["R"].to_numpy(float)
-    L = df["L"].to_numpy(float)
-    C = df["C"].to_numpy(float)
-    Rload = df["Rload"].to_numpy(float)
+    f = df["f"].to_numpy(dtype=float)
+    R = df["R"].to_numpy(dtype=float)
+    L = df["L"].to_numpy(dtype=float)
+    C = df["C"].to_numpy(dtype=float)
+    Rload = df["Rload"].to_numpy(dtype=float)
 
     f_safe = np.clip(f, EPS_F, None)
     R_safe = np.clip(R, R_FLOOR_OHM, None)
@@ -415,7 +415,7 @@ def make_features_rlc_notch(df: pd.DataFrame):
     Rload_eff_safe = np.clip(Rload_eff, R_FLOOR_OHM, None)
 
     if "f0" in df.columns:
-        f0 = df["f0"].to_numpy(float)
+        f0 = df["f0"].to_numpy(dtype=float)
     else:
         f0 = 1.0 / (
             2.0 * np.pi * np.sqrt(np.clip(L_safe * C_safe, EPS_NORM, None))
@@ -425,38 +425,22 @@ def make_features_rlc_notch(df: pd.DataFrame):
     R_eq_safe = np.clip(R_eq, R_FLOOR_OHM, None)
 
     if "Q_eff" in df.columns:
-        Q_eff = df["Q_eff"].to_numpy(float)
+        Q_eff = df["Q_eff"].to_numpy(dtype=float)
     else:
-        Q_eff = np.sqrt(
-            np.clip(L_safe / C_safe, EPS_NORM, None)
-        ) / R_eq_safe
-
-    if "f1" in df.columns:
-        f1 = df["f1"].to_numpy(float)
-    else:
-        alpha = np.sqrt(1.0 + 4.0 * Q_eff * Q_eff)
-        f1 = f0 * (alpha - 1.0) / (2.0 * Q_eff)
-
-    if "f2" in df.columns:
-        f2 = df["f2"].to_numpy(float)
-    else:
-        alpha = np.sqrt(1.0 + 4.0 * Q_eff * Q_eff)
-        f2 = f0 * (alpha + 1.0) / (2.0 * Q_eff)
+        Q_eff = (
+            np.sqrt(np.clip(L_safe / C_safe, EPS_NORM, None))
+            / R_eq_safe
+        )
 
     f0_safe = np.clip(f0, EPS_F, None)
-    f1_safe = np.clip(f1, EPS_F, None)
-    f2_safe = np.clip(f2, EPS_F, None)
-
     log10_f_norm = np.log10(f_safe / f0_safe)
-    log10_f_over_f1 = np.log10(f_safe / f1_safe)
-    log10_f_over_f2 = np.log10(f_safe / f2_safe)
 
     log_Q_eff = safe_log(np.clip(Q_eff, EPS_NORM, None))
 
-    log_R_over_Rload = safe_log(R_safe) - safe_log(Rload_eff_safe)
-
     pass_gain = Rload_eff_safe / (R_safe + Rload_eff_safe)
     log_pass_gain = safe_log(pass_gain)
+
+    log_R_over_Rload = safe_log(R_safe) - safe_log(Rload_eff_safe)
 
     w = 2.0 * np.pi * f_safe
     X_lc = w * L_safe - 1.0 / np.clip(w * C_safe, EPS_NORM, None)
@@ -468,8 +452,6 @@ def make_features_rlc_notch(df: pd.DataFrame):
 
     num_cols = [
         "log10_f_norm",
-        "log10_f_over_f1",
-        "log10_f_over_f2",
         "log_Q_eff",
         "log_pass_gain",
         "log_R_over_Rload",
@@ -478,15 +460,14 @@ def make_features_rlc_notch(df: pd.DataFrame):
 
     X = np.vstack([
         log10_f_norm,
-        log10_f_over_f1,
-        log10_f_over_f2,
         log_Q_eff,
         log_pass_gain,
         log_R_over_Rload,
         log_abs_X_lc_over_R_eq,
     ]).T.astype(float, copy=False)
 
-    assert X.shape[1] == len(num_cols)
+    if X.shape[1] != len(num_cols):
+        raise ValueError("Feature matrix width does not match num_cols")
 
     if not np.isfinite(X).all():
         bad = np.where(~np.isfinite(X))
